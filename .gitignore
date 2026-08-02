@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state belongs outside the repository.
+*.last-run.json
+*.pending-notification.json
+vps-stock.json*
