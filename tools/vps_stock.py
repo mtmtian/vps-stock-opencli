@@ -2368,24 +2368,6 @@ def dedupe_discovery_results(results: Iterable[Dict[str, Any]]) -> List[Dict[str
     return cleaned
 
 
-def compact_memory(content: str, keep_lines: int = 20) -> str:
-    lines = [line for line in content.splitlines() if line.strip()]
-    if keep_lines <= 0:
-        return ""
-    lines = lines[-keep_lines:]
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
-def _append_memory_line(line: str) -> None:
-    path = Path.home() / ".codex" / "automations" / "vps" / "memory.md"
-    try:
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(compact_memory(existing + line.rstrip() + "\n"), encoding="utf-8")
-    except OSError as exc:
-        print("memory write failed: %s" % exc, file=sys.stderr)
-
-
 def _notification_record(transitions: List[Dict[str, Any]]) -> Dict[str, Any]:
     canonical = json.dumps(
         transitions,
@@ -2577,16 +2559,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("notification failed: %s" % exc, file=sys.stderr)
             return 2
     print(json.dumps(output, ensure_ascii=False, separators=(",", ":")), flush=True)
-    _append_memory_line(
-        "%s: check %s; transitions=%d; exceptions=%d; discovery_leads=%d"
-        % (
-            date.today().isoformat(),
-            output["run_status"],
-            len(transitions),
-            len(output["exceptions"]),
-            sum(len(result.get("posts", [])) for result in results if str(result.get("id", "")).startswith("vps-discovery-")),
-        )
-    )
     return 0
 
 

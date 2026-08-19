@@ -34,7 +34,6 @@ from vps_stock import (  # noqa: E402
     check_twitter_discovery,
     check_twitter,
     check_whmcs_offer_html,
-    compact_memory,
     dedupe_discovery_results,
     find_transitions,
     filter_discovery_posts,
@@ -1189,10 +1188,9 @@ Out of Stock
         self.assertEqual([post["id"] for post in result["posts"]], ["reddit:atom-fallback"])
         self.assertIn("search.rss", fetch.call_args_list[1].args[0])
 
-    @patch("vps_stock._append_memory_line")
     @patch("vps_stock.check_provider")
     @patch("vps_stock.select_sources")
-    def test_main_stdout_keeps_transition_summary_parseable(self, select_sources_mock, check_provider_mock, append_memory):
+    def test_main_stdout_keeps_transition_summary_parseable(self, select_sources_mock, check_provider_mock):
         provider = {
             "id": "dmit-reddit",
             "provider": "DMIT",
@@ -1226,10 +1224,9 @@ Out of Stock
         self.assertTrue(output["baseline_created"])
         self.assertNotIn("items", output)
 
-    @patch("vps_stock._append_memory_line")
     @patch("vps_stock.check_provider")
     @patch("vps_stock.select_sources")
-    def test_main_persists_run_report_and_previous_state(self, select_sources_mock, check_provider_mock, append_memory):
+    def test_main_persists_run_report_and_previous_state(self, select_sources_mock, check_provider_mock):
         provider = {
             "id": "dmit-reddit",
             "provider": "DMIT",
@@ -1272,11 +1269,10 @@ Out of Stock
         self.assertEqual(run_report["transitions"][0]["new_post_ids"], ["reddit:new"])
         self.assertEqual(run_report["exceptions"], [])
 
-    @patch("vps_stock._append_memory_line")
     @patch("vps_stock.check_provider")
     @patch("vps_stock.select_sources")
     def test_main_preserves_unselected_and_failed_last_good_state(
-        self, select_sources_mock, check_provider_mock, append_memory
+        self, select_sources_mock, check_provider_mock
     ):
         provider = {
             "id": "dmit-reddit",
@@ -1326,11 +1322,10 @@ Out of Stock
         self.assertEqual(output["run_status"], "degraded")
         self.assertEqual(output["exceptions"][0]["id"], "dmit-reddit")
 
-    @patch("vps_stock._append_memory_line")
     @patch("vps_stock.check_provider")
     @patch("vps_stock.select_sources")
     def test_main_rejects_invalid_state_without_fetch_or_overwrite(
-        self, select_sources_mock, check_provider_mock, append_memory
+        self, select_sources_mock, check_provider_mock
     ):
         select_sources_mock.return_value = []
         with tempfile.TemporaryDirectory() as directory:
@@ -1424,12 +1419,11 @@ Out of Stock
                     vps_stock._atomic_write_text(path, "new\n")
             self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
 
-    @patch("vps_stock._append_memory_line")
     @patch("vps_stock._notify")
     @patch("vps_stock.check_provider")
     @patch("vps_stock.select_sources")
     def test_notification_failure_keeps_pending_event_without_repeating_transition(
-        self, select_sources_mock, check_provider_mock, notify, append_memory
+        self, select_sources_mock, check_provider_mock, notify
     ):
         provider = {
             "id": "official",
@@ -1709,15 +1703,21 @@ Out of Stock
         self.assertEqual(cleaned[1]["posts"], [])
         self.assertEqual(cleaned[1]["status"], "no_recent_signal")
 
-    def test_compact_memory_keeps_only_recent_nonempty_lines(self):
-        content = "\n".join("run-%02d" % index for index in range(25)) + "\n"
+    @patch("vps_stock.check_provider")
+    @patch("vps_stock.select_sources")
+    def test_main_does_not_write_hidden_home_state(self, select_sources_mock, check_provider_mock):
+        select_sources_mock.return_value = []
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            fake_home = Path(directory) / "home"
+            with patch("vps_stock.Path.home", return_value=fake_home), patch(
+                "sys.stdout", io.StringIO()
+            ):
+                exit_code = main(["--state-file", str(state_file)])
 
-        compacted = compact_memory(content, keep_lines=20)
-
-        self.assertNotIn("run-04", compacted)
-        self.assertIn("run-05", compacted)
-        self.assertIn("run-24", compacted)
-        self.assertEqual(len(compacted.strip().splitlines()), 20)
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(fake_home.exists())
+            check_provider_mock.assert_not_called()
 
     def test_discovery_filter_rejects_off_topic_ads_and_affiliate_articles(self):
         now = 2_000_000_000

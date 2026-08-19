@@ -30,6 +30,17 @@ is stored as `unobserved`, and its first later success does not produce a false
 restock notification. Failed attempts on previously valid sources are attached
 as `last_attempt` while the last valid status remains available for comparison.
 
+## State ownership
+
+The executable owns only the explicit state path and its adjacent artifacts:
+`<state>.previous.json`, `<state>.last-run.json`, and
+`<state>.pending-notification.json`. It does not write Codex, Claude, or other
+automation memory and does not depend on an automation ID.
+
+If a scheduler wants a concise run history, the scheduler or its Agent writes
+that history in its own task-scoped memory after parsing stdout. This keeps the
+monitor reusable from cron, CI, Codex, or a terminal without hidden side effects.
+
 The default source order is official provider pages, Exa web discovery, named
 provider X/Reddit leads, and generic X/Reddit discovery. Exa is the preferred
 web-search backend for broad VPS discovery, not an inventory authority: its
