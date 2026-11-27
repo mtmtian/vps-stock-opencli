@@ -2,7 +2,7 @@
 
 - This repository contains only the read-only VPS inventory monitor; do not add proxy deployment, Mihomo/Clash generation, server profiles, or node credentials.
 - Run from the repository root and keep the executable at `tools/vps_stock.py`.
-- Default CLI mode monitors the dynamic ByteVirt Japan ISP and Los Angeles CN2 GIA families, ByteVirt PID 329 annual, and YINNET Singapore VPS ①. Keep old provider, social, and discovery checks out of default mode; `--legacy` and compatible historical selection flags are the only way to select them.
+- Default CLI mode monitors the dynamic ByteVirt Japan ISP and Los Angeles CN2 GIA families, ByteVirt PID 329 annual, PID 324 prepaid, and YINNET Singapore VPS ①. Keep old provider, social, and discovery checks out of default mode; `--legacy` and compatible historical selection flags are the only way to select them.
 - Keep formal standalone sources under `tools/` with a `collect()` API. `tools/bytevirt_source.py` must reuse `tools/vps_stock.py`'s ByteVirt parser rather than implementing a second parser.
 - Keep the default target-mode state separate from legacy `vps-stock.json`; explicit `--state-file` remains caller-owned. Do not add local scheduling, machine-specific absolute paths, notification credentials, or automation configuration to this public repository.
 - Never log in to provider accounts, add products to carts, order servers, change deployments, or touch remote hosts.

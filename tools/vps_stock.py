@@ -1197,8 +1197,11 @@ def check_bwh_json(provider: Dict[str, Any], status_code: int, text: str) -> Dic
 def check_bytevirt_json(provider: Dict[str, Any], status_code: int, text: str) -> Dict[str, Any]:
     result = _base_result(provider)
     cycle = provider.get("billing_cycle", "monthly")
-    period = {"monthly": "month", "annually": "year"}[cycle]
-    ceiling = provider["annual_price_ceiling"] if cycle == "annually" else provider["monthly_price_ceiling"]
+    period = bytevirt_source.CYCLE_PERIODS[cycle]
+    if "term_price_ceiling" in provider:
+        ceiling = provider["term_price_ceiling"]
+    else:
+        ceiling = provider["annual_price_ceiling"] if cycle == "annually" else provider["monthly_price_ceiling"]
     if status_code in (401, 403, 429):
         result["status"] = "blocked"
         result["reason"] = "provider anti-bot or rate-limit response (HTTP %s)" % status_code
@@ -2342,6 +2345,15 @@ def monitorability(
                 "reason": "official public catalog checks Los Angeles CN2 GIA products with a dedicated IPv4 and eligible monthly USD price",
             },
             {
+                "id": "bytevirt-jp-324-prepaid",
+                "provider": "ByteVirt",
+                "region": "Japan",
+                "priority": "value",
+                "level": "stock",
+                "source": bytevirt_source.CATALOG_URL,
+                "reason": "PID 324, up to $25/quarter, $40/half-year or $69/year; one stock signal",
+            },
+            {
                 "id": "bytevirt-la-329-annual",
                 "provider": "ByteVirt",
                 "region": "Los Angeles, US",
@@ -2712,7 +2724,7 @@ def reconcile_bytevirt_catalog(old: Dict[str, Any], results: List[Dict[str, Any]
     observed = {"available", "out_of_stock", "ineligible"}
     if not any(r["status"] in observed for r in rows):
         return old
-    previous_ids = {key for key in old if re.fullmatch(r"bytevirt-\d+(?:-year)?", key)}
+    previous_ids = {key for key in old if re.fullmatch(r"bytevirt-\d+(?:-year|-prepaid)?", key)}
     if not any(old[key].get("status") in observed for key in previous_ids):
         return old
     current_ids = {r["id"] for r in rows}
@@ -2747,6 +2759,9 @@ def _external_observation(
         network = "Los Angeles CN2 GIA; route performance unverified" if is_la else "Japan ISP; route performance unverified"
         ceiling = bytevirt_source.LA_ANNUAL_CEILING_USD if annual else bytevirt_source.PRICE_CEILING_USD
         expected_period = "year" if annual else "month"
+        if key == bytevirt_source.JP_PREPAID_KEY:
+            expected_period = record.get("period", "quarter")
+            ceiling = bytevirt_source.JP_TERM_LIMITS.get(expected_period, 0)
     else:
         plan_name = record.get("name") if isinstance(record.get("name"), str) else yinnet_source.PRODUCT_NAME
         source_url = record.get("url") if isinstance(record.get("url"), str) else yinnet_source.LISTING_URL
@@ -2869,6 +2884,7 @@ def run_target_checks(bytevirt_only: bool = False, timeout: float = 20, run_time
             ("325", "VPS-1024-KVM-ISP-JP", "Japan"),
             ("330", "VPS-1024-KVM-CN2 GIA LA", "Los Angeles, US"),
             ("329-year", "VPS-512-KVM-CN2 GIA LA annual", "Los Angeles, US"),
+            (bytevirt_source.JP_PREPAID_KEY, "VPS-512-KVM-ISP-JP", "Japan"),
         ):
             results.append(
                 _external_observation(

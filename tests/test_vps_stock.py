@@ -287,7 +287,7 @@ class VpsStockParsingTests(unittest.TestCase):
         ids = {item["id"] for item in json.loads(output.getvalue())["items"]}
         self.assertEqual(
             ids,
-            {"bytevirt-jp-isp-series", "bytevirt-la-cn2-gia-series", "bytevirt-la-329-annual"},
+            {"bytevirt-jp-isp-series", "bytevirt-la-cn2-gia-series", "bytevirt-la-329-annual", "bytevirt-jp-324-prepaid"},
         )
 
     def test_default_state_path_uses_standalone_project_namespace(self):
@@ -312,6 +312,7 @@ class VpsStockParsingTests(unittest.TestCase):
                 "bytevirt-jp-isp-series",
                 "bytevirt-la-cn2-gia-series",
                 "bytevirt-la-329-annual",
+                "bytevirt-jp-324-prepaid",
                 yinnet_source.SOURCE_KEY,
             },
         )

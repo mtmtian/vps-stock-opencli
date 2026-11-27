@@ -2,7 +2,7 @@
 
 Standalone, read-only VPS inventory monitoring. The default checks ByteVirt's
 Japan ISP and Los Angeles CN2 GIA product families, ByteVirt PID 329's annual
-offer, and YINNET Singapore VPS ①. The executable lives at
+offer, the Japan 512 MB ISP prepaid offer (PID 324), and YINNET Singapore VPS ①. The executable lives at
 `tools/vps_stock.py`; it never logs in, adds a product to a cart, submits an
 order, or changes a server.
 
@@ -42,7 +42,10 @@ monitor reusable from cron, CI, Codex, or a terminal without hidden side effects
 ByteVirt uses its public catalog JSON to validate SKU identity, route,
 dedicated IPv4, inventory consistency, displayed currency, and price amount.
 Eligible monthly offers must be USD $15 or less. PID 329's annual offer is
-tracked separately with a $66 ceiling. Over-budget and non-monthly offers use
+tracked separately with a $66 ceiling. Japan ISP PID 324
+has one shared restock alert for its prepaid terms, prioritizing the shortest
+qualifying term: $25 per quarter, $40 per half-year, or $69 per year.
+Other over-budget and non-monthly offers use
 the persisted `ineligible` state, so they do not degrade a normal run and a
 later return to budget can still produce a restock transition. Malformed
 catalog data remains `unknown` and preserves the last valid status. Use

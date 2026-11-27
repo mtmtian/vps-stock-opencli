@@ -14,6 +14,10 @@ STORE_URL = "https://bytevirt.com/index.php?m=bvstore"
 PRICE_CEILING_USD = 15.0
 LA_ANNUAL_PID = 329
 LA_ANNUAL_CEILING_USD = 66
+JP_PREPAID_PID = 324
+JP_PREPAID_KEY = f"{JP_PREPAID_PID}-prepaid"
+JP_TERM_LIMITS = {"quarter": 25, "half-year": 40, "year": 69}
+CYCLE_PERIODS = {"monthly": "month", "quarterly": "quarter", "semiannually": "half-year", "annually": "year"}
 REQUEST_TIMEOUT_SECONDS = 20
 FIXED_PRODUCT_IDS = frozenset({325, 330})
 
@@ -219,4 +223,24 @@ def collect(timeout: float = REQUEST_TIMEOUT_SECONDS) -> dict[str, dict[str, Any
     else:
         annual_record = _record_for_product(annual_product, annual_target, True, parser, text)
     results[f"{LA_ANNUAL_PID}-year"] = dict(annual_record, period="year")
+    # All three terms draw on the same stock. Keep one transition per restock.
+    jp_target = dict(expected_by_id[325], product_id=JP_PREPAID_PID, plan_name="VPS-512-KVM-ISP-JP")
+    jp_product = next((p for p, _ in matching if p["pid"] == JP_PREPAID_PID), None)
+    selected = _empty_record({}, jp_target)
+    if jp_product is not None:
+        uncertain = False
+        for cycle, period in CYCLE_PERIODS.items():
+            if period not in JP_TERM_LIMITS:
+                continue
+            limit = JP_TERM_LIMITS[period]
+            target = dict(jp_target, billing_cycle=cycle, term_price_ceiling=limit)
+            row = _record_for_product(jp_product, target, True, parser, text)
+            if row["available"] is None:
+                uncertain = True
+            elif row["price"] is not None and row["price"] <= limit:
+                selected = dict(row, period=period)
+                break
+        else:
+            selected["available"] = None if uncertain else False
+    results[JP_PREPAID_KEY] = selected
     return results
