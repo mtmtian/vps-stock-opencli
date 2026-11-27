@@ -9,3 +9,4 @@ htmlcov/
 *.last-run.json
 *.pending-notification.json
 vps-stock.json*
+vps-stock-targets.json*

@@ -16,9 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import vps_stock  # noqa: E402
+from vps_stock import yinnet_source  # noqa: E402
 
 from vps_stock import (  # noqa: E402
     check_bwh_json,
+    check_bytevirt_json,
     check_colocrossing_markdown,
     check_counted_html,
     check_dedione_html,
@@ -48,12 +50,452 @@ from vps_stock import (  # noqa: E402
 
 
 class VpsStockParsingTests(unittest.TestCase):
+    def _bytevirt_provider(self, product_id=325):
+        return next(
+            provider for provider in vps_stock.PROVIDERS
+            if provider.get("product_id") == product_id
+        )
+
+    def _bytevirt_catalog(
+        self,
+        product_id=325,
+        price=10,
+        cycle="monthly",
+        available=False,
+        display=None,
+        currency=None,
+    ):
+        provider = self._bytevirt_provider(product_id)
+        price_record = {
+            "cycle": cycle,
+            "amount": price,
+            "display": display or "$%.2f USD" % price,
+        }
+        if currency is not None:
+            price_record["currency"] = currency
+        product = {
+            "pid": product_id,
+            "name": provider["plan_name"],
+            "region": provider["target_region"],
+            "line": provider["target_line"],
+            "tier": provider["target_tier"],
+            "subtier": provider["target_subtier"],
+            "stock": {"available": available, "qty": 1 if available else 0},
+            "spec": {"vcpu": 1, "ram": "1 GB", "ipv4": "1", "virt": "KVM"},
+            "prices": [price_record],
+        }
+        return json.dumps({"public_vps": [product]})
+
+    def test_bytevirt_requires_matching_sku_monthly_price_and_dedicated_ipv4(self):
+        provider = self._bytevirt_provider()
+        unavailable = check_bytevirt_json(provider, 200, self._bytevirt_catalog())
+        self.assertEqual(unavailable["status"], "out_of_stock")
+        self.assertEqual(unavailable["plans"][0]["price"]["amount"], 10)
+
+        available = check_bytevirt_json(
+            provider, 200, self._bytevirt_catalog(available=True)
+        )
+        self.assertEqual(available["status"], "available")
+        self.assertEqual(available["plans"][0]["spec"]["ipv4"], "1")
+
+        cad_price = check_bytevirt_json(
+            provider, 200, self._bytevirt_catalog(display="$10.00 CAD")
+        )
+        self.assertEqual(cad_price["status"], "offer_changed")
+        self.assertEqual(cad_price["plans"][0]["price"]["currency"], "CAD")
+        self.assertEqual(
+            check_bytevirt_json(
+                provider,
+                200,
+                self._bytevirt_catalog(display="€10.00 CAD"),
+            )["status"],
+            "unknown",
+        )
+        self.assertEqual(
+            check_bytevirt_json(
+                provider,
+                200,
+                self._bytevirt_catalog(currency="CAD"),
+            )["status"],
+            "unknown",
+        )
+        self.assertEqual(
+            check_bytevirt_json(
+                provider,
+                200,
+                self._bytevirt_catalog(display="$11.00 USD"),
+            )["status"],
+            "unknown",
+        )
+
+        self.assertEqual(
+            check_bytevirt_json(
+                provider, 200, self._bytevirt_catalog(cycle="annually")
+            )["status"],
+            "offer_changed",
+        )
+        self.assertEqual(
+            check_bytevirt_json(
+                provider, 200, self._bytevirt_catalog(price=16, available=True)
+            )["status"],
+            "offer_changed",
+        )
+
+        for catalog in (
+            self._bytevirt_catalog(display=None).replace('"display": "$10.00 USD"', '"display": null'),
+            self._bytevirt_catalog().replace('"ipv4": "1"', '"ipv4": "NAT shared"'),
+            self._bytevirt_catalog().replace('"region": "JP"', '"region": "US"'),
+            "{bad json",
+        ):
+            with self.subTest(catalog=catalog[:40]):
+                result = check_bytevirt_json(provider, 200, catalog)
+                self.assertNotEqual(result["status"], "available")
+
+    def test_bytevirt_offer_changed_state_preserves_then_restores_restock_detection(self):
+        provider = self._bytevirt_provider(330)
+        available = check_bytevirt_json(
+            provider,
+            200,
+            self._bytevirt_catalog(330, price=12, available=True),
+        )
+        changed_price = check_bytevirt_json(
+            provider,
+            200,
+            self._bytevirt_catalog(330, price=16, available=True),
+        )
+        missing_monthly = check_bytevirt_json(
+            provider,
+            200,
+            self._bytevirt_catalog(330, cycle="annually", price=100),
+        )
+        malformed_price = check_bytevirt_json(
+            provider,
+            200,
+            self._bytevirt_catalog(330, display="$12.00 CAD"),
+        )
+
+        self.assertEqual(changed_price["status"], "offer_changed")
+        self.assertEqual(missing_monthly["status"], "offer_changed")
+        self.assertEqual(malformed_price["status"], "unknown")
+
+        state = vps_stock.merge_state({}, [available])
+        self.assertEqual(find_transitions([changed_price], state), [])
+        state = vps_stock.merge_state(state, [changed_price])
+        self.assertEqual(state[provider["id"]]["status"], "offer_changed")
+
+        state_after_schema_error = vps_stock.merge_state(state, [malformed_price])
+        self.assertEqual(state_after_schema_error[provider["id"]]["status"], "offer_changed")
+        self.assertEqual(
+            state_after_schema_error[provider["id"]]["last_attempt"]["status"],
+            "unknown",
+        )
+        self.assertEqual(find_transitions([available], state_after_schema_error), [available])
+
+    def test_bytevirt_only_cli_preserves_offer_change_and_detects_recovery(self):
+        def catalog(price, available):
+            return {
+                str(product_id): {
+                    "name": "VPS target %s" % product_id,
+                    "available": available,
+                    "price": price,
+                    "quantity": 1 if available else 0,
+                    "region": "Japan" if product_id == 325 else "Los Angeles, US",
+                    "url": "https://bytevirt.com/index.php?m=bvstore",
+                }
+                for product_id in (325, 330)
+            }
+
+        outputs = []
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            for payload in (
+                catalog(12, True),
+                catalog(16, False),
+                {"325": {"name": "Japan target", "available": None, "region": "Japan", "url": "https://bytevirt.com/index.php?m=bvstore"}, "330": {"name": "LA target", "available": None, "region": "Los Angeles, US", "url": "https://bytevirt.com/index.php?m=bvstore"}},
+                catalog(12, True),
+            ):
+                output = io.StringIO()
+                with patch("vps_stock.bytevirt_source.collect", return_value=payload), patch("sys.stdout", output):
+                    self.assertEqual(
+                        main(
+                            [
+                                "--bytevirt-only",
+                                "--full",
+                                "--state-file",
+                                str(state_file),
+                            ]
+                        ),
+                        0,
+                    )
+                outputs.append(json.loads(output.getvalue()))
+
+        self.assertEqual(outputs[0]["transitions"], [])
+        self.assertEqual(
+            {item["status"] for item in outputs[1]["items"]}, {"ineligible"}
+        )
+        self.assertEqual({item["status"] for item in outputs[2]["items"]}, {"unknown"})
+        self.assertEqual(
+            {item["status"] for item in outputs[3]["items"]}, {"available"}
+        )
+        self.assertEqual(
+            {item["id"] for item in outputs[3]["transitions"]},
+            {"bytevirt-325", "bytevirt-330"},
+        )
+
+    def test_bytevirt_transition_fires_once_after_restock(self):
+        provider = self._bytevirt_provider(330)
+        out_of_stock = check_bytevirt_json(
+            provider, 200, self._bytevirt_catalog(330, price=12)
+        )
+        available = check_bytevirt_json(
+            provider,
+            200,
+            self._bytevirt_catalog(330, price=12, available=True),
+        )
+        baseline = {out_of_stock["id"]: out_of_stock}
+        self.assertEqual(find_transitions([available], baseline), [available])
+        self.assertEqual(find_transitions([available], {available["id"]: available}), [])
+
+    def test_bytevirt_offers_share_one_public_catalog_fetch(self):
+        products = [
+            json.loads(self._bytevirt_catalog(product_id))["public_vps"][0]
+            for product_id in (325, 330)
+        ]
+        catalog = json.dumps({"public_vps": products})
+        cache = {}
+        with patch("vps_stock._fetch_official", return_value=(200, catalog)) as fetch:
+            results = [
+                check_provider(self._bytevirt_provider(product_id), fetch_cache=cache)
+                for product_id in (325, 330)
+            ]
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual([result["status"] for result in results], ["out_of_stock", "out_of_stock"])
+
+    def test_bytevirt_selection_and_monitorability_are_scoped(self):
+        providers = [
+            item for item in vps_stock.PROVIDERS if item.get("kind") == "bytevirt_json"
+        ]
+        self.assertEqual({provider["product_id"] for provider in providers}, {325, 330})
+        rows = {item["id"]: item for item in monitorability(bytevirt_only=True, legacy=True)}
+        self.assertEqual(set(rows), {provider["id"] for provider in providers})
+        self.assertTrue(all(row["level"] == "stock" for row in rows.values()))
+
+    def test_bytevirt_only_cli_limits_monitorability_output(self):
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            self.assertEqual(main(["--bytevirt-only", "--monitorability"]), 0)
+        ids = {item["id"] for item in json.loads(output.getvalue())["items"]}
+        self.assertEqual(
+            ids,
+            {"bytevirt-jp-isp-series", "bytevirt-la-cn2-gia-series", "bytevirt-la-329-annual"},
+        )
+
     def test_default_state_path_uses_standalone_project_namespace(self):
         with patch("vps_stock.Path.home", return_value=Path("/tmp/test-home")):
             self.assertEqual(
                 vps_stock._state_path(None),
+                Path("/tmp/test-home/.cache/vps-stock-opencli/vps-stock-targets.json"),
+            )
+            self.assertEqual(
+                vps_stock._state_path(None, legacy=True),
                 Path("/tmp/test-home/.cache/vps-stock-opencli/vps-stock.json"),
             )
+            self.assertEqual(
+                vps_stock._state_path("~/custom.json"), Path("~/custom.json").expanduser()
+            )
+
+    def test_default_monitorability_shows_current_targets_and_legacy_is_explicit(self):
+        rows = {item["id"]: item for item in monitorability()}
+        self.assertEqual(
+            set(rows),
+            {
+                "bytevirt-jp-isp-series",
+                "bytevirt-la-cn2-gia-series",
+                "bytevirt-la-329-annual",
+                yinnet_source.SOURCE_KEY,
+            },
+        )
+        self.assertIn("buyvm-lv", {item["id"] for item in monitorability(legacy=True)})
+
+    def test_target_mapper_separates_monthly_and_annual_offers(self):
+        bytevirt_rows = {
+            "329": {
+                "name": "VPS 329 monthly",
+                "available": False,
+                "price": 14.0,
+                "quantity": 0,
+                "region": "Los Angeles, US",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+            },
+            "329-year": {
+                "name": "VPS 329 annual",
+                "available": False,
+                "price": 66.0,
+                "quantity": 0,
+                "region": "Los Angeles, US",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+                "period": "year",
+            },
+        }
+        with patch("vps_stock.bytevirt_source.collect", return_value=bytevirt_rows), patch(
+            "vps_stock.yinnet_source.collect", return_value={}
+        ):
+            results = vps_stock.run_target_checks()
+        mapped = {result["id"]: result for result in results}
+        self.assertEqual(mapped["bytevirt-329"]["status"], "out_of_stock")
+        self.assertEqual(mapped["bytevirt-329-year"]["status"], "out_of_stock")
+        self.assertEqual(
+            mapped["bytevirt-329"]["plans"][0]["price"]["period"], "month"
+        )
+        self.assertEqual(
+            mapped["bytevirt-329-year"]["plans"][0]["price"]["period"], "year"
+        )
+
+    def test_default_cli_uses_targets_and_unknown_preserves_last_good_state(self):
+        old_state = {
+            "bytevirt-325": {
+                "id": "bytevirt-325",
+                "provider": "ByteVirt",
+                "status": "available",
+                "plans": [{"plan": "previous good offer"}],
+            }
+        }
+        unknown = {
+            "325": {
+                "name": "VPS-1024-KVM-ISP-JP",
+                "available": None,
+                "price": None,
+                "quantity": None,
+                "region": "Japan",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(json.dumps(old_state), encoding="utf-8")
+            output = io.StringIO()
+            with patch("vps_stock.bytevirt_source.collect", return_value=unknown), patch(
+                "vps_stock.yinnet_source.collect",
+                return_value={yinnet_source.SOURCE_KEY: {"name": "VPS ①", "available": None}},
+            ), patch("vps_stock.select_sources") as legacy_sources, patch(
+                "sys.stdout", output
+            ):
+                self.assertEqual(main(["--state-file", str(state_file), "--full"]), 0)
+            saved = json.loads(state_file.read_text(encoding="utf-8"))
+
+        legacy_sources.assert_not_called()
+        self.assertEqual(saved["bytevirt-325"]["status"], "available")
+        self.assertEqual(saved["bytevirt-325"]["last_attempt"]["status"], "unknown")
+        reported = {item["id"]: item for item in json.loads(output.getvalue())["items"]}
+        self.assertEqual(reported["bytevirt-325"]["status"], "unknown")
+
+    def test_default_mapper_rejects_invalid_price_and_quantity_contradictions(self):
+        common = {"name": "target", "region": "Japan", "url": "https://example.test"}
+        cases = [
+            {**common, "available": True, "price": None, "quantity": 1},
+            {**common, "available": True, "price": 10.0, "quantity": 0},
+            {**common, "available": False, "price": 10.0, "quantity": 1},
+            {**common, "available": False, "price": "bad", "quantity": 0},
+        ]
+        for record in cases:
+            with self.subTest(record=record):
+                mapped = vps_stock._external_observation("bytevirt", "325", record)
+                self.assertEqual(mapped["status"], "unknown")
+
+    def test_new_bytevirt_sku_and_relisting_only_alert_after_catalog_baseline(self):
+        def sku(number, status):
+            return {"id": f"bytevirt-{number}", "provider": "ByteVirt", "status": status}
+
+        anchor = sku(325, "out_of_stock")
+        added = sku(400, "available")
+        results = [anchor, added]
+        empty = vps_stock.reconcile_bytevirt_catalog({}, results)
+        self.assertEqual(find_transitions(results, empty), [])
+        prior = {anchor["id"]: anchor}
+        baseline = vps_stock.reconcile_bytevirt_catalog(prior, results)
+        self.assertEqual(find_transitions(results, baseline), [added])
+        saved = vps_stock.merge_state(baseline, results)
+        self.assertEqual(find_transitions(results, saved), [])
+        self.assertEqual(vps_stock.reconcile_bytevirt_catalog(saved, [sku(325, "unknown")]), saved)
+        after_delisting = vps_stock.reconcile_bytevirt_catalog(saved, [anchor])
+        self.assertEqual(after_delisting, prior)
+        self.assertEqual(find_transitions(results, vps_stock.reconcile_bytevirt_catalog(after_delisting, results)), [added])
+
+    def test_default_ineligible_offers_are_normal_and_restock_can_recover(self):
+        bytevirt_rows = {
+            "325": {
+                "name": "Japan monthly above budget",
+                "available": False,
+                "price": 16.0,
+                "quantity": 0,
+                "region": "Japan",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+            },
+            "330": {
+                "name": "LA monthly removed",
+                "available": False,
+                "price": None,
+                "quantity": 0,
+                "region": "Los Angeles, US",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+            },
+            "329-year": {
+                "name": "LA annual above budget",
+                "available": False,
+                "price": 70.0,
+                "quantity": 0,
+                "region": "Los Angeles, US",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+                "period": "year",
+            },
+        }
+        with patch("vps_stock.bytevirt_source.collect", return_value=bytevirt_rows), patch(
+            "vps_stock.yinnet_source.collect", return_value={}
+        ):
+            results = vps_stock.run_target_checks()
+        mapped = {item["id"]: item for item in results}
+        self.assertEqual(
+            {mapped[item]["status"] for item in ("bytevirt-325", "bytevirt-330", "bytevirt-329-year")},
+            {"ineligible"},
+        )
+        old_state = vps_stock.merge_state({}, results)
+        recovered = dict(mapped["bytevirt-325"], status="available")
+        self.assertEqual(find_transitions([recovered], old_state), [recovered])
+
+    def test_default_cli_does_not_report_expected_ineligible_offers_as_exceptions(self):
+        bytevirt_rows = {
+            "325": {
+                "name": "Japan monthly above budget",
+                "available": False,
+                "price": 16.0,
+                "quantity": 0,
+                "region": "Japan",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+            },
+            "330": {
+                "name": "LA monthly removed",
+                "available": False,
+                "price": None,
+                "quantity": 0,
+                "region": "Los Angeles, US",
+                "url": "https://bytevirt.com/index.php?m=bvstore",
+            },
+        }
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("vps_stock.bytevirt_source.collect", return_value=bytevirt_rows), patch(
+                "vps_stock.yinnet_source.collect", return_value={}
+            ), patch("sys.stdout", output):
+                self.assertEqual(
+                    main(["--state-file", str(Path(directory) / "state.json"), "--full"]),
+                    0,
+                )
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["run_status"], "complete")
+        self.assertEqual(report["exceptions"], [])
+        self.assertEqual(
+            {item["status"] for item in report["items"]}, {"ineligible"}
+        )
 
     def test_zorocloud_tracks_jp_titan_plus_inventory(self):
         provider = {
@@ -469,7 +911,7 @@ Out of Stock
         self.assertEqual(sources["yt-net-us-lax-b-35"]["plan_name"], "US.LAX.B")
         self.assertEqual(sources["yt-net-us-lax-b-35"]["target_price"], 35.0)
 
-        monitor_rows = {row["id"]: row for row in monitorability() if row["provider"] == "YT.NET"}
+        monitor_rows = {row["id"]: row for row in monitorability(legacy=True) if row["provider"] == "YT.NET"}
         self.assertEqual(monitor_rows["yt-net-us-lax-a-22"]["level"], "order_signal")
         self.assertEqual(monitor_rows["yt-net-us-lax-b-35"]["level"], "order_signal")
 
@@ -598,6 +1040,8 @@ Out of Stock
         self.assertIn("hostdare-lax-cn2-amd", focused)
         self.assertIn("hostdare-lax-cn2-hdd", focused)
         self.assertIn("bwh-lax-cn2", focused)
+        self.assertIn("bytevirt-jp-isp-1024-monthly", focused)
+        self.assertIn("bytevirt-lax-cn2-gia-1024-monthly", focused)
         self.assertIn("zgovps-lax-optimized-starter-18-quarterly", focused)
         self.assertIn("dedione-lax-cmin2-1c1g10g-annual", focused)
         self.assertNotIn("greencloud-x", focused)
@@ -739,7 +1183,7 @@ Out of Stock
         self.assertNotIn("cloudcone-lax", sources)
 
     def test_monitorability_describes_non_social_boundaries(self):
-        rows = {item["id"]: item for item in monitorability()}
+        rows = {item["id"]: item for item in monitorability(legacy=True)}
         self.assertEqual(rows["buyvm-lv"]["level"], "stock")
         self.assertEqual(rows["buyvm-ny"]["level"], "stock")
         self.assertEqual(rows["buyvm-miami"]["level"], "stock")
@@ -775,6 +1219,7 @@ Out of Stock
                 "zgovps-lax-special-52",
                 "zgovps-lax-optimized-starter-18-quarterly",
                 "dedione-lax-cmin2-1c1g10g-annual",
+                "bytevirt-lax-cn2-gia-1024-monthly",
                 "dmit-reddit",
                 "vps-discovery-reddit-cn2-vps",
                 "vps-discovery-x-cn2-vps",
@@ -1215,7 +1660,7 @@ Out of Stock
             state_file = Path(directory) / "state.json"
             stdout = io.StringIO()
             with patch("sys.stdout", stdout):
-                exit_code = main(["--state-file", str(state_file)])
+                exit_code = main(["--legacy", "--state-file", str(state_file)])
 
         self.assertEqual(exit_code, 0)
         output = json.loads(stdout.getvalue())
@@ -1258,7 +1703,7 @@ Out of Stock
             state_file = Path(directory) / "state.json"
             state_file.write_text(json.dumps(old_state), encoding="utf-8")
             with patch("sys.stdout", io.StringIO()):
-                exit_code = main(["--state-file", str(state_file)])
+                exit_code = main(["--legacy", "--state-file", str(state_file)])
 
             previous_state = json.loads(Path(str(state_file) + ".prev").read_text(encoding="utf-8"))
             run_report = json.loads(Path(str(state_file) + ".last-run.json").read_text(encoding="utf-8"))
@@ -1312,7 +1757,7 @@ Out of Stock
             state_file.write_text(json.dumps(old_state), encoding="utf-8")
             stdout = io.StringIO()
             with patch("sys.stdout", stdout):
-                exit_code = main(["--state-file", str(state_file)])
+                exit_code = main(["--legacy", "--state-file", str(state_file)])
             saved = json.loads(state_file.read_text(encoding="utf-8"))
 
         self.assertEqual(exit_code, 0)
@@ -1333,7 +1778,7 @@ Out of Stock
             original = "[]\n"
             state_file.write_text(original, encoding="utf-8")
             with patch("sys.stderr", io.StringIO()):
-                exit_code = main(["--state-file", str(state_file)])
+                exit_code = main(["--legacy", "--state-file", str(state_file)])
 
             self.assertEqual(exit_code, 2)
             self.assertEqual(state_file.read_text(encoding="utf-8"), original)
@@ -1460,6 +1905,7 @@ Out of Stock
             with patch("sys.stderr", io.StringIO()):
                 first_exit = main(
                     [
+                        "--legacy",
                         "--state-file",
                         str(state_file),
                         "--notify-url",
@@ -1477,6 +1923,7 @@ Out of Stock
             with patch("sys.stdout", stdout):
                 second_exit = main(
                     [
+                        "--legacy",
                         "--state-file",
                         str(state_file),
                         "--notify-url",
@@ -1713,7 +2160,7 @@ Out of Stock
             with patch("vps_stock.Path.home", return_value=fake_home), patch(
                 "sys.stdout", io.StringIO()
             ):
-                exit_code = main(["--state-file", str(state_file)])
+                exit_code = main(["--legacy", "--state-file", str(state_file)])
 
             self.assertEqual(exit_code, 0)
             self.assertFalse(fake_home.exists())

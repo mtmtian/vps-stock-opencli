@@ -1,10 +1,10 @@
 # vps-stock-opencli
 
-Standalone, read-only VPS inventory monitoring built around official public
-sources plus optional OpenCLI and Exa discovery. The executable lives at
-`tools/vps_stock.py`; it checks public
-provider pages and recent social leads; it never logs in, adds a product to a
-cart, submits an order, or changes a server.
+Standalone, read-only VPS inventory monitoring. The default checks ByteVirt's
+Japan ISP and Los Angeles CN2 GIA product families, ByteVirt PID 329's annual
+offer, and YINNET Singapore VPS ①. The executable lives at
+`tools/vps_stock.py`; it never logs in, adds a product to a cart, submits an
+order, or changes a server.
 
 Run it from the repository root:
 
@@ -12,28 +12,26 @@ Run it from the repository root:
 python3 tools/vps_stock.py
 ```
 
-The default state file is `~/.cache/vps-stock-opencli/vps-stock.json`, outside
-the repository. Override it with `--state-file` when needed. The monitor reports
-only new availability/lead transitions and meaningful source exceptions.
-Social posts and third-party catalog observations remain leads until the
-provider's official page is checked.
+The default target-mode state file is
+`~/.cache/vps-stock-opencli/vps-stock-targets.json`, separate from the historic
+`vps-stock.json`. Override it with `--state-file` when needed. The default
+monitor reports only new availability transitions and source errors.
 
-The first successful run creates a baseline and does not notify existing stock
-or posts. Later transport, parser, rate-limit, and dependency failures are
-written to `<state>.last-run.json` but do not overwrite the last valid source
-state. Runs with `--cn2-only` or `--no-social` merge their checked sources into
-the existing state instead of deleting unselected history. State, previous
-state, and run-report files are replaced atomically; webhook events use a
-persisted pending record and deterministic idempotency key until delivery.
-Each source establishes its own baseline: a source whose first attempt fails
-is stored as `unobserved`, and its first later success does not produce a false
-restock notification. Failed attempts on previously valid sources are attached
-as `last_attempt` while the last valid status remains available for comparison.
+The first successful run creates a baseline and does not notify existing stock.
+Later transport and parser failures are written to `<state>.last-run.json` but
+do not overwrite the last valid source state. State, previous state, and
+run-report files are replaced atomically; webhook events use a persisted
+pending record and deterministic idempotency key until delivery. Each source
+establishes its own baseline: a source whose first attempt fails is stored as
+`unobserved`, and its first later success does not produce a false restock
+notification. After a valid ByteVirt catalog baseline, a newly listed eligible
+SKU already in stock also triggers a notification. Failed attempts on previously valid sources are attached as
+`last_attempt` while the last valid status remains available for comparison.
 
 ## State ownership
 
 The executable owns only the explicit state path and its adjacent artifacts:
-`<state>.previous.json`, `<state>.last-run.json`, and
+`<state>.prev`, `<state>.last-run.json`, and
 `<state>.pending-notification.json`. It does not write Codex, Claude, or other
 automation memory and does not depend on an automation ID.
 
@@ -41,28 +39,56 @@ If a scheduler wants a concise run history, the scheduler or its Agent writes
 that history in its own task-scoped memory after parsing stdout. This keeps the
 monitor reusable from cron, CI, Codex, or a terminal without hidden side effects.
 
-The default source order is official provider pages, Exa web discovery, named
-provider X/Reddit leads, and generic X/Reddit discovery. Exa is the preferred
-web-search backend for broad VPS discovery, not an inventory authority: its
-results are kept only when they are within the three-day window and contain
-eligible price plus concrete VPS evidence, then still require official
-verification. Configure it locally with:
+ByteVirt uses its public catalog JSON to validate SKU identity, route,
+dedicated IPv4, inventory consistency, displayed currency, and price amount.
+Eligible monthly offers must be USD $15 or less. PID 329's annual offer is
+tracked separately with a $66 ceiling. Over-budget and non-monthly offers use
+the persisted `ineligible` state, so they do not degrade a normal run and a
+later return to budget can still produce a restock transition. Malformed
+catalog data remains `unknown` and preserves the last valid status. Use
+`--bytevirt-only` to check these ByteVirt targets without requesting YINNET.
+
+YINNET is read from its public Singapore VPS listing and tracks VPS ① only.
+The parser requires an exact product link, monthly USD price, and a consistent
+stock signal. Route performance is not inferred from the listing.
+
+## Legacy source set
+
+Use `--legacy` to run the historic wider provider and discovery sources; this
+mode uses the previous `~/.cache/vps-stock-opencli/vps-stock.json` state file.
+For backward compatibility, `--all`, `--cn2-only`, and `--no-social` also
+select legacy mode when supplied without `--legacy`. An explicit
+`--state-file` is used as given in either mode. Plain `--monitorability` shows
+the current targets; `--legacy --monitorability` prints the historic matrix.
+
+The legacy source order is official provider pages, Exa web discovery, named
+provider X/Reddit leads, and generic X/Reddit discovery. Exa is a web-search
+lead source, not an inventory authority: results are kept only when they are
+within the three-day window and contain eligible price plus concrete VPS
+evidence, then still require official verification. Configure it locally with:
 
 ```bash
 mcporter config add exa https://mcp.exa.ai/mcp
 ```
 
-If Exa is unavailable, the monitor reports the exception and continues with
-the remaining sources. `--no-social` remains an official-source-only check and
-skips Exa and X/Reddit discovery.
+If Exa is unavailable, legacy mode reports the exception and continues with
+the remaining sources. In legacy mode, `--no-social` skips Exa and X/Reddit
+discovery and keeps only official sources.
+
+Legacy ByteVirt checks use the fixed `VPS-1024-KVM-ISP-JP` and
+`VPS-1024-KVM-CN2 GIA LA` SKUs. A non-USD currency, price over $15/month, or
+removal of the monthly cycle is recorded as `offer_changed` in legacy mode.
+Conflicting currency fields or malformed catalog data remain `unknown` and
+preserve the last valid state. The public catalog's orderability flag is not a
+guarantee of successful provisioning.
 
 X and Reddit discovery use `opencli` when available. Both `opencli` and
 `mcporter` are optional integrations: a missing command is reported as a source
 exception and does not disable official-source checks.
 
-The default overall source-check budget is 300 seconds (`--run-timeout`).
-Official pages are checked first, duplicate official URLs share one response,
-and transient transport/5xx failures receive one retry. A Twitter/X 429 opens
+The legacy overall source-check budget is 300 seconds (`--run-timeout`).
+Legacy official pages are checked first, duplicate official URLs share one
+response, and transient transport/5xx failures receive one retry. A Twitter/X 429 opens
 a per-run circuit breaker so later X searches are skipped without erasing
 their previous successful state. Set `--run-timeout 0` only when an unbounded
 manual run is intentional.

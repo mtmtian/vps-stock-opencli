@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only stock monitor for US VPS offers.
+"""Read-only stock monitor for VPS offers.
 
 The monitor never logs in or adds an item to a cart.  It reports ``blocked``
 when a provider's anti-bot page prevents an inventory check.
@@ -11,6 +11,7 @@ import argparse
 import hashlib
 from html import unescape
 import json
+import math
 import os
 import re
 import signal
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import time
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from itertools import chain
 from pathlib import Path
@@ -27,6 +29,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
+
+if __package__:
+    from . import bytevirt_source, yinnet_source
+else:
+    import bytevirt_source
+    import yinnet_source
 
 
 def _external_command_env() -> Dict[str, str]:
@@ -332,6 +340,42 @@ PROVIDERS: List[Dict[str, Any]] = [
         "network": "Premium: CN2 for China Telecom; CMIN2 for China Unicom and China Mobile",
         "focus": True,
     },
+    {
+        "id": "bytevirt-jp-isp-1024-monthly",
+        "provider": "ByteVirt",
+        "region": "Japan",
+        "kind": "bytevirt_json",
+        "url": "https://bytevirt.com/index.php?m=bvstore",
+        "fetch_url": "https://bytevirt.com/index.php?m=bvstore&action=catalog",
+        "product_id": 325,
+        "plan_name": "VPS-1024-KVM-ISP-JP",
+        "target_region": "JP",
+        "target_line": "ISP",
+        "target_tier": "isp",
+        "target_subtier": "",
+        "monthly_price_ceiling": 15.0,
+        "priority": "value",
+        "network": "Japan ISP route; China Mobile latency unverified",
+        "focus": True,
+    },
+    {
+        "id": "bytevirt-lax-cn2-gia-1024-monthly",
+        "provider": "ByteVirt",
+        "region": "Los Angeles, US",
+        "kind": "bytevirt_json",
+        "url": "https://bytevirt.com/index.php?m=bvstore",
+        "fetch_url": "https://bytevirt.com/index.php?m=bvstore&action=catalog",
+        "product_id": 330,
+        "plan_name": "VPS-1024-KVM-CN2 GIA LA",
+        "target_region": "US",
+        "target_line": "China Optimized CN2 GIA",
+        "target_tier": "china",
+        "target_subtier": "cn2gia",
+        "monthly_price_ceiling": 15.0,
+        "priority": "cn2",
+        "network": "Los Angeles CN2 GIA; China Mobile latency unverified",
+        "focus": True,
+    },
 ]
 
 
@@ -487,6 +531,15 @@ _NOVIXLINK_CAD_PRICE = re.compile(r"\$\s*(?P<amount>\d+(?:\.\d+)?)\s*CAD\b", re.
 _NOVIXLINK_USD_PRICE = re.compile(r"~\s*\$\s*(?P<amount>\d+(?:\.\d+)?)\s*USD\b", re.IGNORECASE)
 _YT_NET_PLAN = re.compile(r"(?m)^###\s+(?P<plan>US\.LAX\.[A-Z])\s*$")
 _YT_NET_MONTHLY_PRICE = re.compile(r"¥\s*(?P<amount>\d+(?:\.\d+)?)\s*/\s*月")
+_BYTEVIRT_PRICE_DISPLAY = re.compile(
+    r"^\s*(?P<symbol>[$€£¥])\s*(?P<amount>\d+(?:\.\d+)?)\s+(?P<currency>[A-Z]{3})\s*$"
+)
+_BYTEVIRT_SYMBOL_CURRENCIES = {
+    "$": {"USD", "CAD", "AUD", "NZD", "SGD", "HKD"},
+    "€": {"EUR"},
+    "£": {"GBP"},
+    "¥": {"CNY", "JPY"},
+}
 
 _TWITTER_POSITIVE = ("coupon", "sale", "discount", "promo", "restock", "in stock", "available", "优惠", "折扣", "优惠码", "补货", "有货", "上架", "开售")
 _TWITTER_NEGATIVE = ("out of stock", "sold out", "unavailable", "无货", "缺货", "断货", "售罄", "抢空")
@@ -1138,6 +1191,170 @@ def check_bwh_json(provider: Dict[str, Any], status_code: int, text: str) -> Dic
         result["status"] = "out_of_stock"
         result["confidence"] = "high"
         result["reason"] = "public BWH order data marks all matching products out of stock"
+    return result
+
+
+def check_bytevirt_json(provider: Dict[str, Any], status_code: int, text: str) -> Dict[str, Any]:
+    result = _base_result(provider)
+    cycle = provider.get("billing_cycle", "monthly")
+    period = {"monthly": "month", "annually": "year"}[cycle]
+    ceiling = provider["annual_price_ceiling"] if cycle == "annually" else provider["monthly_price_ceiling"]
+    if status_code in (401, 403, 429):
+        result["status"] = "blocked"
+        result["reason"] = "provider anti-bot or rate-limit response (HTTP %s)" % status_code
+        return result
+    if status_code >= 400:
+        result["status"] = "unreachable"
+        result["reason"] = "HTTP %s" % status_code
+        return result
+
+    try:
+        catalog = json.loads(text)
+    except (TypeError, ValueError):
+        catalog = None
+    products = catalog.get("public_vps") if isinstance(catalog, dict) else None
+    if not isinstance(products, list):
+        result["reason"] = "ByteVirt catalog response has an unexpected schema"
+        return result
+
+    matches = [
+        product for product in products
+        if isinstance(product, dict) and product.get("pid") == provider["product_id"]
+    ]
+    if len(matches) != 1:
+        result["reason"] = "target ByteVirt product is missing or ambiguous in the public catalog"
+        return result
+
+    product = matches[0]
+    if (
+        product.get("name") != provider["plan_name"]
+        or product.get("region") != provider["target_region"]
+        or product.get("line") != provider["target_line"]
+        or product.get("tier") != provider["target_tier"]
+        or product.get("subtier") != provider["target_subtier"]
+    ):
+        result["reason"] = "ByteVirt target product identity or route does not match the configured offer"
+        return result
+
+    stock = product.get("stock")
+    spec = product.get("spec")
+    prices = product.get("prices")
+    if not isinstance(stock, dict) or not isinstance(spec, dict) or not isinstance(prices, list):
+        result["reason"] = "ByteVirt target product has an unexpected stock, spec, or price schema"
+        return result
+    if not isinstance(stock.get("available"), bool) or spec.get("ipv4") != "1":
+        result["reason"] = "ByteVirt stock flag or dedicated IPv4 field is missing or invalid"
+        return result
+
+    quantity = stock.get("qty")
+    if quantity is not None and (
+        isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0
+    ):
+        result["reason"] = "ByteVirt inventory quantity is invalid"
+        return result
+    stock_conflicts_with_quantity = (
+        quantity == 0 and stock["available"]
+    ) or (
+        quantity is not None and quantity > 0 and not stock["available"]
+    )
+    if stock_conflicts_with_quantity:
+        result["reason"] = "ByteVirt stock flag conflicts with its published quantity"
+        return result
+
+    if not prices or any(
+        not isinstance(price, dict)
+        or not isinstance(price.get("cycle"), str)
+        or not price["cycle"]
+        for price in prices
+    ):
+        result["reason"] = "ByteVirt target product has an invalid price-cycle list"
+        return result
+
+    matching_prices = [price for price in prices if price["cycle"] == cycle]
+    if not matching_prices:
+        result["status"] = "offer_changed"
+        result["confidence"] = "high"
+        result["plans"] = [
+            {
+                "plan": product["name"],
+                "product_id": product["pid"],
+                "available": False,
+                "count": quantity,
+                "price": None,
+            }
+        ]
+        result["reason"] = f"ByteVirt target offer no longer publishes the {cycle} billing cycle"
+        return result
+    if len(matching_prices) != 1:
+        result["reason"] = f"ByteVirt target does not publish exactly one {cycle} price"
+        return result
+    offer = matching_prices[0]
+    amount = offer.get("amount")
+    display = offer.get("display")
+    display_match = _BYTEVIRT_PRICE_DISPLAY.fullmatch(display) if isinstance(display, str) else None
+    if (
+        isinstance(amount, bool)
+        or not isinstance(amount, (int, float))
+        or not math.isfinite(amount)
+        or amount <= 0
+        or display_match is None
+    ):
+        result["reason"] = f"ByteVirt {cycle} price amount or display is missing or invalid"
+        return result
+
+    try:
+        amount_decimal = Decimal(str(amount))
+        display_amount = Decimal(display_match.group("amount"))
+    except InvalidOperation:
+        result["reason"] = f"ByteVirt {cycle} price amount or display is invalid"
+        return result
+
+    display_currency = display_match.group("currency")
+    declared_currency = offer.get("currency")
+    symbol = display_match.group("symbol")
+    if (
+        amount_decimal != display_amount
+        or display_currency not in _BYTEVIRT_SYMBOL_CURRENCIES.get(symbol, set())
+        or declared_currency is not None and declared_currency != display_currency
+    ):
+        result["reason"] = f"ByteVirt {cycle} price amount, display, and currency fields conflict"
+        return result
+
+    price_eligible = (
+        display_currency == "USD"
+        and amount <= ceiling
+    )
+    available = stock["available"] and price_eligible
+    plan = {
+        "plan": product["name"],
+        "product_id": product["pid"],
+        "available": available,
+        "count": quantity,
+        "price": {
+            "amount": amount,
+            "currency": display_currency,
+            "period": period,
+            "price_eligible": price_eligible,
+        },
+        "spec": {
+            key: spec.get(key)
+            for key in ("vcpu", "ram", "disk", "traffic", "port", "ipv4", "virt")
+        },
+    }
+    result["plans"] = [plan]
+    result["confidence"] = "high"
+    if display_currency != "USD":
+        result["status"] = "offer_changed"
+        result["reason"] = f"ByteVirt {cycle} offer is displayed in {display_currency}, not USD"
+    elif not price_eligible:
+        result["status"] = "offer_changed"
+        result["reason"] = f"{cycle} USD price exceeds the configured ${ceiling:.2f} ceiling"
+    elif stock["available"]:
+        result["status"] = "available"
+        result["reason"] = f"official public catalog marks the matching {cycle} offer as available"
+    else:
+        result["status"] = "out_of_stock"
+        result["reason"] = f"official public catalog marks the matching {cycle} offer out of stock"
     return result
 
 
@@ -1947,6 +2164,8 @@ def check_provider(
         result = check_counted_html(provider, status_code, text)
     elif provider["kind"] == "bwh_json":
         result = check_bwh_json(provider, status_code, text)
+    elif provider["kind"] == "bytevirt_json":
+        result = check_bytevirt_json(provider, status_code, text)
     elif provider["kind"] == "whmcs_offer_html":
         result = check_whmcs_offer_html(provider, status_code, text)
     elif provider["kind"] == "dedione_html":
@@ -2096,9 +2315,62 @@ def select_sources(cn2_only: bool = False, all_providers: bool = False) -> Itera
     )
 
 
-def monitorability(cn2_only: bool = False, all_providers: bool = False) -> List[Dict[str, str]]:
+def monitorability(
+    cn2_only: bool = False,
+    all_providers: bool = False,
+    bytevirt_only: bool = False,
+    legacy: bool = False,
+) -> List[Dict[str, str]]:
+    if not legacy:
+        targets = [
+            {
+                "id": "bytevirt-jp-isp-series",
+                "provider": "ByteVirt",
+                "region": "Japan",
+                "priority": "value",
+                "level": "stock",
+                "source": bytevirt_source.CATALOG_URL,
+                "reason": "official public catalog checks Japan ISP products with a dedicated IPv4 and eligible monthly USD price",
+            },
+            {
+                "id": "bytevirt-la-cn2-gia-series",
+                "provider": "ByteVirt",
+                "region": "Los Angeles, US",
+                "priority": "cn2",
+                "level": "stock",
+                "source": bytevirt_source.CATALOG_URL,
+                "reason": "official public catalog checks Los Angeles CN2 GIA products with a dedicated IPv4 and eligible monthly USD price",
+            },
+            {
+                "id": "bytevirt-la-329-annual",
+                "provider": "ByteVirt",
+                "region": "Los Angeles, US",
+                "priority": "cn2",
+                "level": "stock",
+                "source": bytevirt_source.CATALOG_URL,
+                "reason": "official public catalog checks PID 329 annual USD pricing up to $66 and stock",
+            },
+            {
+                "id": yinnet_source.SOURCE_KEY,
+                "provider": "YINNET",
+                "region": "Singapore",
+                "priority": "value",
+                "level": "stock",
+                "source": yinnet_source.LISTING_URL,
+                "reason": "official public listing checks VPS ① monthly price and orderability signals",
+            },
+        ]
+        if bytevirt_only:
+            targets = [row for row in targets if row["provider"] == "ByteVirt"]
+        return targets
+
     rows = []
-    for provider in select_non_social_providers(cn2_only=cn2_only, all_providers=all_providers):
+    providers = (
+        (provider for provider in PROVIDERS if provider["kind"] == "bytevirt_json")
+        if bytevirt_only
+        else select_non_social_providers(cn2_only=cn2_only, all_providers=all_providers)
+    )
+    for provider in providers:
         kind = provider["kind"]
         if kind == "frantech_html":
             level = "stock"
@@ -2109,6 +2381,9 @@ def monitorability(cn2_only: bool = False, all_providers: bool = False) -> List[
         elif kind == "bwh_json":
             level = "stock"
             reason = "public order JSON exposes matching datacenters and product outOfStock state"
+        elif kind == "bytevirt_json":
+            level = "stock"
+            reason = "official public catalog JSON exposes exact SKU, monthly USD price, dedicated IPv4, and stock quantity"
         elif kind == "whmcs_offer_html":
             level = "stock"
             reason = "official WHMCS offer page exposes per-plan enabled or out-of-stock order state"
@@ -2153,10 +2428,11 @@ def monitorability(cn2_only: bool = False, all_providers: bool = False) -> List[
     return rows
 
 
-def _state_path(value: Optional[str]) -> Path:
+def _state_path(value: Optional[str], legacy: bool = False) -> Path:
     if value:
         return Path(value).expanduser()
-    return Path.home() / ".cache" / "vps-stock-opencli" / "vps-stock.json"
+    filename = "vps-stock.json" if legacy else "vps-stock-targets.json"
+    return Path.home() / ".cache" / "vps-stock-opencli" / filename
 
 
 def _previous_state_path(state_file: Path) -> Path:
@@ -2430,9 +2706,213 @@ def find_transitions(results: Iterable[Dict[str, Any]], old: Dict[str, Any]) -> 
     return transitions
 
 
+def reconcile_bytevirt_catalog(old: Dict[str, Any], results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """A new SKU in an established catalog was absent at the previous check."""
+    rows = [r for r in results if r.get("provider") == "ByteVirt"]
+    observed = {"available", "out_of_stock", "ineligible"}
+    if not any(r["status"] in observed for r in rows):
+        return old
+    previous_ids = {key for key in old if re.fullmatch(r"bytevirt-\d+(?:-year)?", key)}
+    if not any(old[key].get("status") in observed for key in previous_ids):
+        return old
+    current_ids = {r["id"] for r in rows}
+    baseline = old.copy()
+    for key in previous_ids - current_ids:
+        del baseline[key]
+    for row in rows:
+        if row["status"] in observed and row["id"] not in baseline:
+            baseline[row["id"]] = {"status": "absent"}
+    return baseline
+
+
+def _external_observation(
+    source: str,
+    key: str,
+    record: Dict[str, Any],
+    error: str = "",
+) -> Dict[str, Any]:
+    """Normalize a standalone collector result into the persisted CLI schema."""
+    if source == "bytevirt":
+        annual = key == "329-year"
+        product_key = key.removesuffix("-year")
+        region = record.get("region")
+        if not isinstance(region, str) or region not in {"Japan", "Los Angeles, US", "US (LA)"}:
+            region = "Los Angeles, US" if product_key in {"329", "330", "290", "291", "292", "293", "296"} else "Japan"
+        is_la = region != "Japan"
+        plan_name = record.get("name") if isinstance(record.get("name"), str) else "ByteVirt PID %s" % key
+        source_url = record.get("url") if isinstance(record.get("url"), str) else bytevirt_source.STORE_URL
+        item_id = "bytevirt-%s" % key
+        provider_name = "ByteVirt"
+        priority = "cn2" if is_la else "value"
+        network = "Los Angeles CN2 GIA; route performance unverified" if is_la else "Japan ISP; route performance unverified"
+        ceiling = bytevirt_source.LA_ANNUAL_CEILING_USD if annual else bytevirt_source.PRICE_CEILING_USD
+        expected_period = "year" if annual else "month"
+    else:
+        plan_name = record.get("name") if isinstance(record.get("name"), str) else yinnet_source.PRODUCT_NAME
+        source_url = record.get("url") if isinstance(record.get("url"), str) else yinnet_source.LISTING_URL
+        item_id = key
+        provider_name = "YINNET"
+        region = yinnet_source.REGION
+        priority = "value"
+        network = "Singapore VPS; route performance unverified"
+        ceiling = bytevirt_source.PRICE_CEILING_USD
+        expected_period = "month"
+
+    provider = {
+        "id": item_id,
+        "provider": provider_name,
+        "region": region,
+        "priority": priority,
+        "network": network,
+        "url": source_url,
+        "fetch_url": source_url,
+    }
+    result = _base_result(provider)
+    available = record.get("available")
+    quantity = record.get("quantity")
+    price_value = record.get("price")
+    if quantity is not None and (
+        isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0
+    ):
+        available = None
+    valid_price = price_value is None
+    if price_value is not None:
+        try:
+            valid_price = (
+                not isinstance(price_value, bool)
+                and isinstance(price_value, (int, float))
+                and math.isfinite(float(price_value))
+                and price_value > 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_price = False
+    if not valid_price:
+        available = None
+    period = record.get("period", expected_period)
+    if period != expected_period:
+        available = None
+
+    eligible_price = valid_price and price_value is not None and price_value <= ceiling
+    if available is True and quantity == 0:
+        available = None
+    if available is True and price_value is None:
+        available = None
+    elif available is False and quantity is not None and quantity > 0 and eligible_price:
+        available = None
+
+    if error:
+        available = None
+    if available is None:
+        result["status"] = "unknown"
+        result["reason"] = error or "source result is incomplete or internally inconsistent"
+    elif available is False and not eligible_price and (
+        source == "bytevirt" or price_value is not None
+    ):
+        result["status"] = "ineligible"
+        result["reason"] = "offer is outside the configured USD price or billing-period target"
+    elif available is False:
+        result["status"] = "out_of_stock"
+        result["reason"] = "official source reports the monitored offer unavailable"
+    elif not eligible_price:
+        result["status"] = "ineligible"
+        result["reason"] = "offer is above the configured USD price ceiling"
+    else:
+        result["status"] = "available"
+        result["reason"] = "official source reports an eligible offer in stock"
+
+    result["confidence"] = "high" if available is not None else "none"
+    result["plans"] = [
+        {
+            "plan": plan_name,
+            "product_id": key if source == "bytevirt" else None,
+            "available": result["status"] == "available",
+            "count": quantity,
+            "price": (
+                {
+                    "amount": price_value,
+                    "currency": "USD",
+                    "period": period,
+                    "price_eligible": bool(eligible_price),
+                }
+                if price_value is not None
+                else None
+            ),
+        }
+    ]
+    if result["status"] == "unknown":
+        result["plans"] = []
+    return result
+
+
+def run_target_checks(bytevirt_only: bool = False, timeout: float = 20, run_timeout: float = 300) -> List[Dict[str, Any]]:
+    """Run the current ByteVirt and YINNET target collectors once each."""
+    results: List[Dict[str, Any]] = []
+    deadline = time.monotonic() + run_timeout if run_timeout > 0 else None
+
+    def request_timeout() -> float:
+        remaining = timeout if deadline is None else min(timeout, deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("source-check budget exhausted")
+        return remaining
+
+    try:
+        bytevirt_rows = bytevirt_source.collect(timeout=request_timeout())
+        if not isinstance(bytevirt_rows, dict):
+            raise ValueError("ByteVirt collector returned an invalid result")
+        for key, row in bytevirt_rows.items():
+            if not isinstance(key, str) or not isinstance(row, dict):
+                continue
+            results.append(_external_observation("bytevirt", key, row))
+    except Exception as exc:
+        reason = "ByteVirt source failed (%s): %s" % (type(exc).__name__, exc)
+        for key, name, region in (
+            ("325", "VPS-1024-KVM-ISP-JP", "Japan"),
+            ("330", "VPS-1024-KVM-CN2 GIA LA", "Los Angeles, US"),
+            ("329-year", "VPS-512-KVM-CN2 GIA LA annual", "Los Angeles, US"),
+        ):
+            results.append(
+                _external_observation(
+                    "bytevirt",
+                    key,
+                    {"name": name, "region": region, "available": None},
+                    error=reason,
+                )
+            )
+
+    if not bytevirt_only:
+        try:
+            yinnet_rows = yinnet_source.collect(timeout=request_timeout())
+            if not isinstance(yinnet_rows, dict):
+                raise ValueError("YINNET collector returned an invalid result")
+            for key, row in yinnet_rows.items():
+                if isinstance(key, str) and isinstance(row, dict):
+                    results.append(_external_observation("yinnet", key, row))
+        except Exception as exc:
+            reason = "YINNET source failed (%s): %s" % (type(exc).__name__, exc)
+            results.append(
+                _external_observation(
+                    "yinnet",
+                    yinnet_source.SOURCE_KEY,
+                    {"name": yinnet_source.PRODUCT_NAME, "available": None},
+                    error=reason,
+                )
+            )
+    return results
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="use the historic broad source list and its independent state file",
+    )
     parser.add_argument("--cn2-only", action="store_true", help="only monitor CN2-optimized US offers")
+    parser.add_argument(
+        "--bytevirt-only",
+        action="store_true",
+        help="only monitor the configured ByteVirt Japan and Los Angeles offers",
+    )
     parser.add_argument("--all", action="store_true", help="include non-focus sources")
     parser.add_argument("--no-social", action="store_true", help="skip X/Reddit lead checks")
     parser.add_argument("--monitorability", action="store_true", help="print non-social monitorability matrix and exit")
@@ -2448,12 +2928,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="overall source-check budget in seconds; 0 disables the deadline",
     )
     args = parser.parse_args(argv)
+    legacy_mode = args.legacy or args.cn2_only or args.all or args.no_social
 
     if args.monitorability:
-        print(json.dumps({"items": monitorability(args.cn2_only, args.all)}, ensure_ascii=False, indent=2), flush=True)
+        print(
+            json.dumps(
+                {
+                    "items": monitorability(
+                        args.cn2_only,
+                        args.all,
+                        args.bytevirt_only,
+                        legacy=legacy_mode,
+                    )
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            flush=True,
+        )
         return 0
 
-    state_file = _state_path(args.state_file)
+    state_file = _state_path(args.state_file, legacy=legacy_mode)
     try:
         loaded_state, state_exists = _read_state(state_file)
     except RuntimeError as exc:
@@ -2476,22 +2971,30 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("pending notification failed: %s" % exc, file=sys.stderr)
             return 2
 
-    source_iter = (
-        select_non_social_providers(args.cn2_only, args.all)
-        if args.no_social
-        else select_sources(args.cn2_only, args.all)
-    )
     check_started_at = time.monotonic()
-    results = dedupe_discovery_results(
-        run_checks(
-            source_iter,
-            args.timeout,
-            args.social_timeout,
-            args.run_timeout,
+    if legacy_mode:
+        if args.bytevirt_only:
+            source_iter = (provider for provider in PROVIDERS if provider["kind"] == "bytevirt_json")
+        else:
+            source_iter = (
+                select_non_social_providers(args.cn2_only, args.all)
+                if args.no_social
+                else select_sources(args.cn2_only, args.all)
+            )
+        results = dedupe_discovery_results(
+            run_checks(
+                source_iter,
+                args.timeout,
+                args.social_timeout,
+                args.run_timeout,
+            )
         )
-    )
+    else:
+        results = run_target_checks(args.bytevirt_only, args.timeout, args.run_timeout)
     old = prune_state_posts(loaded_state)
     baseline_created = not state_exists or not old
+    if not legacy_mode and not baseline_created:
+        old = reconcile_bytevirt_catalog(old, results)
     transitions = [] if baseline_created else find_transitions(results, old)
     exceptions = [
         {
